@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Local OpenAI-compatible gateway that exposes every model registered on the DSH llm service (DeepSeek, WorkBuddy, our-free-model) so external clients such as Codex can use them.",
+  "author": "chenzhao",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
