@@ -1,38 +1,62 @@
-# LLM gateway
+# DSH LLM gateway
 
-A local OpenAI-compatible HTTP endpoint in front of the DSH `llm` service. External clients — Codex CLI, Codex desktop, ZCode, Claude Code, any OpenAI SDK — therefore see exactly the models this DSH profile offers, with the same credentials, retry policy and token accounting DSH already uses.
+A local, OpenAI-compatible gateway that exposes **every model registered in DSH**
+through `ctx.llm` — no upstream protocol is reimplemented here. Codex and other
+OpenAI-compatible clients can use the models DSH already knows about.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/healthz` | Liveness plus the number of models the gateway can see. |
-| GET | `/v1/models` | Every registered model, as `provider/model`. |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions, streaming or not. |
-| POST | `/v1/responses` | OpenAI Responses API, for Codex. |
+- `GET /healthz` — liveness, model count.
+- `GET /v1/models` — the model list; ids use the prefixes `deepseek/`, `buddy/`, `free/`.
+- `POST /v1/chat/completions` — Chat Completions (streaming and non-streaming).
+- `POST /v1/responses` — Responses API (streaming and non-streaming), used by Codex.
 
-No upstream is contacted directly — each request is dispatched through `ctx.llm.stream()`, so a provider added or removed in DSH changes what the gateway serves with no restart.
+By default the server listens on `127.0.0.1:8392`. Configuration lives in the
+bundle patch (`host`, `port`, `apiKey`); the gateway does not define a Config schema,
+so all values are read from the plugin config with defaults.
 
-## Model ids
+## Grouped model ids
 
-`<provider>/<model>`, for example:
+Codex's model selector shows the public id, so DSH internal provider ids are not
+used as prefixes. Providers are grouped as:
 
-- `deepseek-official/deepseek-v4.1-flash`
-- `workbuddy/deepseek-v4.1-flash`
-- `our-free-model/kimi-k3`
+| Providers | Prefix | Example id |
+| --- | --- | --- |
+| `deepseek-official`, `deepseek-account`, `deepseek-flash`, `deepseek-v4.1-flash`, `deepseek-v4.1-flash-free` | `deepseek/` | `deepseek/deepseek-flash` |
+| `workbuddy`, `workbuddy-global` | `buddy/` | `buddy/deepseek-v4.1-flash` |
+| everything else (the `our-free-model` aggregator lanes) | `free/` | `free/opencode/beam-free` |
 
-A bare model id is accepted when exactly one provider offers it; an ambiguous one names the candidate providers in the error.
+If a model id already contains `/`, it is kept intact after the prefix, so
+`opencode/beam-free` and `reflection/beam-free` do not collide.
 
-## Configuration
+The model catalog is cached for 10 seconds. A request resolves the wire id by
+exact public id, then raw model id, then a `<provider>/<model>` split; a group
+prefix is explicitly rejected as a provider.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `host` | `127.0.0.1` | Bind address. Keep it on loopback unless you intend LAN exposure. |
-| `port` | `8392` | Listen port. |
-| `apiKey` | `''` | When non-empty, `Authorization: Bearer <key>` is required. |
+## Tool-call history
 
-## Limitations
+Responses `function_call` items are merged into the preceding assistant message
+as tool-call blocks (`call_id` is preserved), and `function_call_output` becomes a
+`role: tool` message with the matching `toolCallId`. Reasoning items are skipped
+because their encrypted payloads are upstream-private. Developer messages are
+kept as system prompts. This prevents the upstream 11148 "tool call records do
+not match" error.
 
-- Text and tool calls only; image and file content blocks are not translated from the OpenAI wire format yet.
-- `temperature` and `max_tokens` pass through; other sampling parameters are ignored.
-- Streaming uses the standard SSE shapes for both wires, including `[DONE]` for chat.
+Chat Completions history is converted the same way: assistant `tool_calls`
+become tool-call blocks and `role: tool` messages keep their `call_id`.
+
+## Codex
+
+`build-dsh-catalog.cjs` fetches `/v1/models` and clones the bundled model catalog
+schema from `codex debug models --bundled`, then writes the configured
+`model_catalog_json` path. Point Codex at:
+
+```toml
+model = "buddy/deepseek-v4.1-flash"
+model_provider = "dsh"
+model_catalog_json = "/Users/zhaochen/.codex/dsh-llm-gateway-models.json"
+
+[model_providers.dsh]
+base_url = "http://127.0.0.1:8392/v1"
+wire_api = "responses"
+```

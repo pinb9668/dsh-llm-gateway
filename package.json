@@ -3,24 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local OpenAI-compatible gateway that exposes every model registered on the DSH llm service (DeepSeek, WorkBuddy, our-free-model, ...) so external clients such as Codex can use them.",
+  "description": "Local OpenAI-compatible gateway exposing every DSH llm model",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": [
-    "index.js",
-    "cordis.patch.yml",
-    "locale",
-    "docs",
-    "icon.svg"
-  ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
+  "files": ["index.js", "cordis.patch.yml", "locale", "docs", "icon.svg"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "license": "MIT"
 }

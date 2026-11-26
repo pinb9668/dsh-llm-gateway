@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "模型网关",
-    "description": "把 DSH 模型服务上注册的全部模型（DeepSeek、WorkBuddy、our-free-model 等）暴露成本机 OpenAI 兼容接口，Codex、ZCode 等外部客户端因此能用上与界面里相同的模型。",
+    "title": "DSH 大模型网关",
+    "description": "把 DSH 中已注册的全部模型通过本地 OpenAI 兼容网关（Chat Completions 与 Responses）暴露给 Codex 等外部客户端。",
     "detail": "docs/DETAIL.md"
   }
 }

@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "LLM gateway",
-    "description": "Exposes every model registered on the DSH llm service as a local OpenAI-compatible endpoint, so Codex, ZCode and other external clients can use the same DeepSeek, WorkBuddy and our-free-model models the app offers.",
+    "title": "DSH LLM gateway",
+    "description": "Exposes every model registered in DSH through a local OpenAI-compatible gateway (Chat Completions and Responses) for Codex and other clients.",
     "detail": "docs/DETAIL.md"
   }
 }

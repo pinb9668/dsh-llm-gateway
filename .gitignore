@@ -1,0 +1,3 @@
+# Backup snapshots kept locally while iterating; never published.
+*.bak
+*.bak-*

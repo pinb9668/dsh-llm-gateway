@@ -1,4 +1,3 @@
-# Mounts the local OpenAI-compatible gateway over the DSH llm service.
 - insert:
     - id: dsh-llm-gateway
       name: '@local/dsh-llm-gateway'
