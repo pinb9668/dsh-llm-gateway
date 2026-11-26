@@ -131,6 +131,16 @@ function contentToBlocks(content) {
     if (part === null || typeof part !== 'object') continue;
     if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
       if (typeof part.text === 'string' && part.text !== '') blocks.push(textBlock(part.text));
+      continue;
+    }
+    // Keep image parts so materializeImages() can admit them through DSH's
+    // attachment service. Dropping them here made the model report "no image".
+    if (part.type === 'input_image' || part.type === 'image_url' || part.image_url !== undefined) {
+      const url = typeof part.image_url === 'object' && part.image_url !== null
+        ? part.image_url.url
+        : part.image_url ?? part.url;
+      if (typeof url === 'string' && url !== '') blocks.push({ type: 'image-url', url });
+      continue;
     }
   }
   return blocks;
