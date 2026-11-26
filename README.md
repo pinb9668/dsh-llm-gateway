@@ -112,6 +112,7 @@ bundle 自带 `cordis.patch.yml`，安装时自动插入插件行，不需要手
 | `host` | `127.0.0.1` | 绑定地址。默认只绑回环，局域网内其它机器访问不到 |
 | `port` | `8392` | 监听端口；非法值静默回退到默认值，不会报错 |
 | `apiKey` | 空 | 为空表示不鉴权；非空时要求 `Authorization: Bearer <key>` 全串精确匹配 |
+| `maxBodyBytes` | 256 MiB | 单个请求体上限。Codex 每轮重发整段历史，带图会话会很大；超过就回 413。缩小它是给暴露到公网的实例加一道闸 |
 
 > 网关**不导出 Config schema**：所有值从插件行的 `config` 里读，缺字段就用默认值。
 > 因此写错字段名不会报错，只会被忽略——改完记得看日志里的 `listening on http://…`。
@@ -303,14 +304,18 @@ wire_api = "responses"
 | 余额不足 / 额度用尽 | 归为账号失败 | 402 `ACCOUNT_QUOTA` + 「充值或换模型组」 |
 | 429 / 冷却中 | 归为限流 | 429 `RATE_LIMIT` + 「等冷却，立刻重发还是同一句」 |
 | 只有思考没有正文 | 判为空回答，不当成功 | 502 `empty_reasoning_only`，让客户端按自己的策略重试 |
-| 请求体过大 | `content-length` 与实际字节各卡一次 | 413 `request body too large (limit 67108864 bytes)` |
+| 请求体过大 | `content-length` 与实际字节各卡一次，边读边计不缓冲整个 body | 413 `request body too large (limit 268435456 bytes)` + `x-should-retry: false` |
 | 请求体不是合法 JSON | 直接拒绝 | 400 `request body is not valid JSON` |
 | 确定性失败被反复重试 | 响应头显式拒绝 | `x-should-retry: false`、`retry-after: 0` |
 
 前七条（`PROMPT_TOO_LONG`、`TOOL_MISMATCH`、`CHANNEL_REJECT`、`IMAGE_INVALID`、`EMPTY_CONTENT`、
-`ACCOUNT_QUOTA`、`RATE_LIMIT`）都带 `x-should-retry: false`；5xx 与网络类**不带**，保持可重试。
+`ACCOUNT_QUOTA`、`RATE_LIMIT`）都带 `x-should-retry: false`，**413 也带**；5xx 与网络类**不带**，保持可重试。
 
 > 这个头只能出现在**非流式**响应上：流式响应头早就发出去了，收尾时只能改事件体的内容。
+
+> 413 这一条值得单独说：同一份历史重发还是超限，重试没有任何意义。缺了这个头时
+> Codex 会按状态码策略重连五轮（界面上显示「正在重新连接 5/5」），每轮把几十 MB
+> 重新传一遍，最后仍拿到同一句拒绝。请求体上限默认 256 MiB，可用 `maxBodyBytes` 调整。
 
 ## 已知限制
 
@@ -339,14 +344,20 @@ wire_api = "responses"
 ## 开发与测试
 
 ```bash
+npm test        # 等价于下面两条
 node tests/stream-failure.mjs
+node tests/body-limit.mjs
 ```
 
-六个用例覆盖流式失败上报的回归：上游失败必须发 `response.failed` / `error` 帧而不是伪装成
-`response.completed` / `finish_reason: stop`，有半截正文时也一样；正常回答不受影响。
+`stream-failure.mjs` 六个用例覆盖流式失败上报的回归：上游失败必须发 `response.failed` / `error` 帧
+而不是伪装成 `response.completed` / `finish_reason: stop`，有半截正文时也一样；正常回答不受影响。
+
+`body-limit.mjs` 四个用例真正起一个网关，覆盖请求体上限：超限必须回 413 且带
+`x-should-retry: false` 与 `retry-after: 0`；`content-length` 缺失（分块上传）时仍按实际字节拦截；
+上限可由 `maxBodyBytes` 调整；默认值容得下几十 MB 的带图历史。
 
 未覆盖的部分（改代码时自己补测）：请求转换与配对修复、槽位换算、路由解析、附件落地、状态码映射表、
-认证与 413。
+认证。
 
 `index.js` 单文件、零依赖，只用到 Node 内建模块与 Web 标准（`fetch`、`Response`、`ReadableStream`）。
 

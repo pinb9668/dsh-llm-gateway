@@ -17,7 +17,14 @@ export const name = 'dsh-llm-gateway';
 // 没有该服务时退化为占位文本（见 imagePlaceholder）。
 export const inject = ['llm', 'attachments'];
 
-const DEFAULTS = { host: '127.0.0.1', port: 8392, apiKey: '' };
+const DEFAULTS = {
+  host: '127.0.0.1',
+  port: 8392,
+  apiKey: '',
+  // 请求体上限。Codex 每轮都会把整段历史重发一遍，带图的会话里 base64 图片
+  // 会把这一个请求推到几十 MB —— 默认值必须容得下正常的多图历史。
+  maxBodyBytes: 256 * 1024 * 1024,
+};
 const CACHE_MS = 10_000;
 const GROUP_PREFIXES = new Set(['deepseek', 'buddy', 'free']);
 
@@ -115,8 +122,41 @@ function normalizeConfig(raw) {
     if (typeof raw.host === 'string' && raw.host !== '') config.host = raw.host;
     if (Number.isInteger(raw.port) && raw.port > 0 && raw.port < 65536) config.port = raw.port;
     if (typeof raw.apiKey === 'string') config.apiKey = raw.apiKey;
+    if (Number.isInteger(raw.maxBodyBytes) && raw.maxBodyBytes > 0) config.maxBodyBytes = raw.maxBodyBytes;
   }
   return config;
+}
+
+/** 字节数 → 便于读的 MB/KB，用于日志。 */
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/**
+ * 把入站请求体读完并丢弃。
+ *
+ * 用途只有一个：我们已经决定拒绝这个请求（例如超限），但客户端还在往上写。
+ * 此时直接 break 或 destroy socket 会让客户端看到 broken pipe，具体原因反而
+ * 传达不到；读完剩余字节再写响应，客户端才能正常读到 413 和它的错误体。
+ *
+ * 有上限保护：最多再排空 maxDrainBytes，防止恶意客户端用无限流占住连接。
+ */
+async function drain(request, maxDrainBytes = 512 * 1024 * 1024) {
+  let drained = 0;
+  try {
+    for await (const chunk of request) {
+      drained += chunk.length;
+      if (drained > maxDrainBytes) {
+        request.destroy();
+        return;
+      }
+    }
+  } catch {
+    /* 客户端先断了，无所谓 */
+  }
 }
 
 function textBlock(text) {
@@ -963,33 +1003,33 @@ const NO_RETRY_HEADERS = Object.freeze({
 /**
  * 请求体超限。用一个具名类而不是「message 里带魔数」：
  * 调用方必须对它回 **413**（协议上的正确答案），当成普通内部错误会变成 500。
+ *
+ * 必须带 `x-should-retry: false`：超限是**确定性**失败，同一份历史重发还是超限。
+ * 没有这个头时 Codex 会按 413 之外的状态码策略重试五轮（界面上显示
+ * 「正在重新连接 5/5」），每一轮都把几十 MB 重新传一遍，然后拿到同一句拒绝。
  */
 class RequestBodyTooLargeError extends HttpError {
   constructor(limitBytes) {
-    super(413, `request body too large (limit ${limitBytes} bytes)`, 'invalid_request_error');
+    super(
+      413,
+      `request body too large (limit ${limitBytes} bytes); compact the conversation or start a new task`,
+      'invalid_request_error',
+      NO_RETRY_HEADERS,
+    );
     this.name = 'RequestBodyTooLargeError';
     this.limitBytes = limitBytes;
   }
 }
 
-/**
- * 网关接受的请求体上限。
- *
- * 参考 dsh-connect-workbuddy 的 RequestBodyTooLargeError：超限必须回 **413**，
- * 而不是让它变成一个内存爆掉后的 500。这里比插件宽松（图片 base64 会很大），
- * 但仍然是有限的。
- */
-const REQUEST_BODY_LIMIT = 64 * 1024 * 1024;
-
-async function readJson(request) {
+async function readJson(request, limitBytes) {
   const declared = Number(request.headers.get('content-length') ?? 0);
-  if (Number.isFinite(declared) && declared > REQUEST_BODY_LIMIT) {
-    throw new RequestBodyTooLargeError(REQUEST_BODY_LIMIT);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    throw new RequestBodyTooLargeError(limitBytes);
   }
   const text = await request.text();
   // content-length 不可信（可能缺失或撒谎），按实际读到的字节再卡一次。
-  if (Buffer.byteLength(text, 'utf8') > REQUEST_BODY_LIMIT) {
-    throw new RequestBodyTooLargeError(REQUEST_BODY_LIMIT);
+  if (Buffer.byteLength(text, 'utf8') > limitBytes) {
+    throw new RequestBodyTooLargeError(limitBytes);
   }
   if (text.trim() === '') return {};
   try {
@@ -1679,7 +1719,7 @@ export function apply(ctx, rawConfig) {
     }
 
     if (request.method === 'POST' && path === '/v1/chat/completions') {
-      const body = await readJson(request);
+      const body = await readJson(request, config.maxBodyBytes);
       let messages = chatMessagesToDsh(body.messages, { provider: 'gateway', model: body.model });
       messages = await materializeImages(messages, { attachments: attachmentsService });
       if (messages.length === 0) throw new HttpError(400, 'messages must not be empty');
@@ -1732,7 +1772,7 @@ export function apply(ctx, rawConfig) {
     }
 
     if (request.method === 'POST' && path === '/v1/responses') {
-      const body = await readJson(request);
+      const body = await readJson(request, config.maxBodyBytes);
       let messages = responsesToDsh(body, { provider: 'gateway', model: body.model });
       messages = await materializeImages(messages, { attachments: attachmentsService });
       if (messages.length === 0) throw new HttpError(400, 'input must not be empty');
@@ -1800,16 +1840,48 @@ export function apply(ctx, rawConfig) {
     let result;
     try {
       // node:http IncomingMessage has no .text(); wrap it as a Web Request.
-      const chunks = [];
-      for await (const chunk of request) chunks.push(chunk);
-      const body = chunks.length === 0 ? undefined : Buffer.concat(chunks);
-      const absolute = `http://${request.headers.host ?? `${config.host}:${config.port}`}${request.url ?? '/'}`;
-      const webRequest = new Request(absolute, {
-        method: request.method,
-        headers: request.headers,
-        body: request.method === 'GET' || request.method === 'HEAD' ? undefined : body,
-      });
-      result = await handle(webRequest);
+      //
+      // 边读边计字节：先把几十 MB 全读进内存再判断超限，等于把「拒绝」变成
+      // 「先占满内存再拒绝」。超限后**继续把剩下的字节读掉但丢弃**，而不是
+      // 直接 break 或 destroy socket —— 前者会销毁入站流、后者会重置连接，
+      // 两种情况下客户端都只看到 broken pipe，读不到 413 和 `x-should-retry:
+      // false`，于是照样重试五轮。把请求体排空再回响应，客户端才能读到结论。
+      const declared = Number(request.headers['content-length'] ?? 0);
+      if (Number.isFinite(declared) && declared > config.maxBodyBytes) {
+        log(`413 request body ${formatBytes(declared)} exceeds limit ${formatBytes(config.maxBodyBytes)} (${request.method} ${request.url})`);
+        // 还没开始读：先把客户端可能已经发出的字节排掉，再让它读响应。
+        await drain(request);
+        result = errorResponse(new RequestBodyTooLargeError(config.maxBodyBytes));
+      } else {
+        const chunks = [];
+        let received = 0;
+        let overLimit = false;
+        for await (const chunk of request) {
+          received += chunk.length;
+          if (received > config.maxBodyBytes) {
+            // 超限：丢掉已读的，后续全部丢弃，但仍然读完。
+            if (!overLimit) {
+              overLimit = true;
+              chunks.length = 0;
+            }
+            continue;
+          }
+          if (!overLimit) chunks.push(chunk);
+        }
+        if (overLimit) {
+          log(`413 request body over limit ${formatBytes(config.maxBodyBytes)} (${request.method} ${request.url})`);
+          result = errorResponse(new RequestBodyTooLargeError(config.maxBodyBytes));
+        } else {
+          const body = chunks.length === 0 ? undefined : Buffer.concat(chunks);
+          const absolute = `http://${request.headers.host ?? `${config.host}:${config.port}`}${request.url ?? '/'}`;
+          const webRequest = new Request(absolute, {
+            method: request.method,
+            headers: request.headers,
+            body: request.method === 'GET' || request.method === 'HEAD' ? undefined : body,
+          });
+          result = await handle(webRequest);
+        }
+      }
     } catch (error) {
       if (process.env.DSH_GATEWAY_DEBUG) process.stderr.write(`${error?.stack ?? String(error)}\n`);
       result = errorResponse(error);

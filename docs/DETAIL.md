@@ -19,9 +19,10 @@ token accounting and provider adapters stay inside DSH.
 - `POST /v1/responses` — Responses API (streaming and non-streaming), used by Codex.
 
 By default the server listens on `127.0.0.1:8392`. Configuration lives in the
-bundle patch (`host`, `port`, `apiKey`); the gateway does not define a Config schema,
-so all values are read from the plugin config with defaults. Unknown keys are
-ignored silently.
+bundle patch (`host`, `port`, `apiKey`, `maxBodyBytes`); the gateway does not define
+a Config schema, so all values are read from the plugin config with defaults.
+Unknown keys are ignored silently. `maxBodyBytes` defaults to 256 MiB: Codex resends
+the whole history every turn, and image-heavy conversations get large quickly.
 
 All routes require `Authorization: Bearer <apiKey>` when `apiKey` is non-empty,
 including `/healthz`. The gateway sets no CORS headers and has no `OPTIONS`
@@ -117,9 +118,14 @@ Non-streaming errors are shaped `{error: {message, type}}`; `type` is
 `server_error` or `upstream_error`. Streaming errors carry `message`, `type`,
 `code` and `gateway_hint` in the event body.
 
-A request body over 64 MiB returns 413; malformed JSON returns 400; a turn that
-produced reasoning but no text returns 502 `empty_reasoning_only` so the client
-retries instead of receiving an empty success.
+A request body over `maxBodyBytes` (256 MiB by default) returns 413 with
+`x-should-retry: false` and `retry-after: 0` — resending the same history is just
+as oversized, and without that header Codex retries five times, re-uploading tens
+of megabytes each round. The size is counted while reading, and the remaining bytes
+are drained before the reply, so the client actually reads the 413 instead of a
+broken pipe. Malformed JSON returns 400; a turn that produced reasoning but no text
+returns 502 `empty_reasoning_only` so the client retries instead of receiving an
+empty success.
 
 Cached token counts are written to both `prompt_tokens_details.cached_tokens` and
 `prompt_cache_hit_tokens` (Responses: `input_tokens_details.cached_tokens`), and
@@ -174,5 +180,12 @@ turn can leave an SSE connection quiet.
 `node tests/stream-failure.mjs` runs six regression cases for streaming failure
 reporting: an upstream failure must emit `response.failed` / an `error` frame
 rather than a `response.completed` or `finish_reason: stop`, including after
-partial text; normal answers are unaffected. Conversion, pairing repair, slots,
-routing, attachments and the status map are not covered.
+partial text; normal answers are unaffected.
+
+`node tests/body-limit.mjs` starts a real gateway and runs four cases for the
+request-body limit: an oversized body must return 413 with `x-should-retry: false`
+and `retry-after: 0`; a missing `content-length` (chunked upload) is still counted;
+`maxBodyBytes` is honoured; and the default accepts tens of megabytes.
+
+Conversion, pairing repair, slots, routing, attachments and the status map are not
+covered.
