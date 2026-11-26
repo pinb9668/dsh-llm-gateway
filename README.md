@@ -100,7 +100,7 @@ bundle 自带 `cordis.patch.yml`，安装时自动插入插件行，不需要手
 ```yaml
 - insert:
     - id: dsh-llm-gateway
-      name: '@chenzhao/dsh-llm-gateway'
+      name: '@morgan9668/dsh-llm-gateway'
       config:
         host: '127.0.0.1'
         port: 8392
