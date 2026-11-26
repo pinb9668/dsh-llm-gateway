@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="LLM gateway">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3A7BFF"/>
+      <stop offset="1" stop-color="#39FFD1"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#0A1020" stroke="url(#g)" stroke-width="2"/>
+  <path d="M18 22h12a6 6 0 0 1 6 6v8a6 6 0 0 0 6 6h4" fill="none" stroke="url(#g)" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M18 42h12" fill="none" stroke="#3A7BFF" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="18" cy="22" r="3.5" fill="#39FFD1"/>
+  <circle cx="18" cy="42" r="3.5" fill="#3A7BFF"/>
+  <circle cx="46" cy="42" r="3.5" fill="#39FFD1"/>
+</svg>

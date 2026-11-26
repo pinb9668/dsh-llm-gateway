@@ -1,0 +1,8 @@
+# Mounts the local OpenAI-compatible gateway over the DSH llm service.
+- insert:
+    - id: dsh-llm-gateway
+      name: '@local/dsh-llm-gateway'
+      config:
+        host: '127.0.0.1'
+        port: 8392
+        apiKey: ''
