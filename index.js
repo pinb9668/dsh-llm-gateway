@@ -150,6 +150,36 @@ function isInlineImageUrl(value) {
   return typeof value === 'string' && /^data:image\//iu.test(value);
 }
 
+const IMAGE_FETCH_TIMEOUT_MS = 15_000;
+const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+/** 拉取远端图片 → { mediaType, bytes }，带超时与硬上限。失败返回 undefined。 */
+async function fetchRemoteImage(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    if (!res.ok) return undefined;
+    const mediaType = String(res.headers.get('content-type') ?? '').toLowerCase().split(';')[0];
+    if (!/^image\/(png|jpeg|webp|gif)$/u.test(mediaType)) return undefined;
+    if (Number(res.headers.get('content-length') ?? 0) > IMAGE_MAX_BYTES) return undefined;
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > IMAGE_MAX_BYTES) return undefined;
+    return { mediaType, bytes };
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** 解析 data URL → { mediaType, bytes }。解析失败返回 undefined。 */
 function parseDataUrl(url) {
   if (typeof url !== 'string') return undefined;
@@ -228,6 +258,57 @@ function failureOf(reason) {
   if (reason === undefined || reason === null) return undefined;
   if (reason.kind !== 'error' && reason.kind !== 'aborted') return undefined;
   return reason.failure ?? { message: 'upstream failed', code: 'UPSTREAM_ERROR' };
+}
+
+/**
+ * Classify an upstream failure into an HTTP status plus an actionable hint.
+ *
+ * workbuddy2api-panel keeps a 19-kind taxonomy and, crucially, does NOT treat
+ * request-level failures (bad params, tool mismatch, quota, prompt too long)
+ * as account failures: retrying the same body or rotating accounts is useless
+ * there. Only account/transport failures get 502/429 and may recover.
+ */
+function classifyFailure(failure) {
+  const code = String(failure?.code ?? '').toUpperCase();
+  const message = String(failure?.message ?? '');
+  if (code === 'ACCOUNT_QUOTA' || /insufficient balance|credits exhausted|余额不足|额度不足/i.test(message)) {
+    return { status: 402, code: 'ACCOUNT_QUOTA', hint: 'Upstream account has no balance; top up or switch model group.' };
+  }
+  if (code === 'RATE_LIMIT' || /rate limit|quota exceeded|too many requests|429|限流|冷却/i.test(message)) {
+    return { status: 429, code: 'RATE_LIMIT', hint: 'Upstream is rate limited; retry after the cooldown or use another group.' };
+  }
+  if (/11148|tool invocation|tool_call.*match|工具调用记录/i.test(message)) {
+    return { status: 400, code: 'TOOL_MISMATCH', hint: 'Tool-call history is inconsistent; start a new task.' };
+  }
+  if (/11128|unapproved channel|渠道校验|request illegal/i.test(message)) {
+    return { status: 400, code: 'CHANNEL_REJECT', hint: 'Upstream rejected the prompt shape; shorten the system prompt or switch model.' };
+  }
+  if (/11135|invalid image|image.*invalid|图片/i.test(message)) {
+    return { status: 400, code: 'IMAGE_INVALID', hint: 'Upstream could not read the image; use a small PNG/JPEG data URL.' };
+  }
+  if (/11115|prompt is too long|context.*exceed|超长|上下文/i.test(message)) {
+    return { status: 400, code: 'PROMPT_TOO_LONG', hint: 'Input exceeds the model context; shorten the conversation.' };
+  }
+  if (/11151|empty content/i.test(message)) {
+    return { status: 400, code: 'EMPTY_CONTENT', hint: 'A message had empty content; this was repaired where possible.' };
+  }
+  return { status: 502, code: failure?.code ?? 'UPSTREAM_ERROR', hint: undefined };
+}
+
+/** Build an OpenAI-shaped error object with the classified status and hint. */
+function classifiedError(failure) {
+  const classified = classifyFailure(failure);
+  return {
+    status: classified.status,
+    body: {
+      message: classified.hint
+        ? `${failure?.message ?? 'upstream failed'} — ${classified.hint}`
+        : failure?.message ?? 'upstream failed',
+      type: classified.status >= 500 ? 'server_error' : 'upstream_error',
+      code: classified.code,
+      gateway_hint: classified.hint,
+    },
+  };
 }
 
 function uuid() {
@@ -351,17 +432,34 @@ async function materializeImages(chatMessages, options = {}) {
   const attachments = options.attachments;
   /** 待发的图片：{ mediaType, bytes } */
   const pending = [];
+  /** URL -> resolved image | 'failed'. Remote fetches are async. */
+  const resolved = new Map();
 
-  const extract = (content) => {
+  const resolveUrl = async (url) => {
+    if (resolved.has(url)) return resolved.get(url);
+    let value;
+    if (/^data:/iu.test(url)) {
+      value = parseDataUrl(url) ?? 'failed';
+    } else if (/^https?:\/\//iu.test(url) && attachments !== undefined) {
+      value = await fetchRemoteImage(url);
+      if (value === undefined) value = 'failed';
+    } else {
+      value = 'failed';
+    }
+    resolved.set(url, value);
+    return value;
+  };
+
+  const extract = async (content) => {
     if (!Array.isArray(content)) return content;
     const kept = [];
     for (const part of content) {
       if (part === null || typeof part !== 'object') continue;
       // 'image-url' 是 chatMessagesToDsh 内部为「还没存成附件的内联图」打的标记。
       if (part.type === 'image-url') {
-        const parsed = typeof part.url === 'string' ? parseDataUrl(part.url) : undefined;
-        if (parsed !== undefined && attachments !== undefined) {
-          pending.push(parsed);
+        const value = typeof part.url === 'string' ? await resolveUrl(part.url) : 'failed';
+        if (value !== 'failed' && attachments !== undefined) {
+          pending.push(value);
           continue;
         }
         kept.push(textBlock(imagePlaceholder(part.url, '图片')));
@@ -371,12 +469,12 @@ async function materializeImages(chatMessages, options = {}) {
         const raw = typeof part.image_url === 'object' && part.image_url !== null
           ? part.image_url.url
           : part.image_url;
-        const parsed = typeof raw === 'string' ? parseDataUrl(raw) : undefined;
-        if (parsed !== undefined && attachments !== undefined) {
-          pending.push(parsed);
+        const value = typeof raw === 'string' ? await resolveUrl(raw) : 'failed';
+        if (value !== 'failed' && attachments !== undefined) {
+          pending.push(value);
           continue;
         }
-        // 没有附件服务、或不是 data URL：留占位文本。
+        // 没有附件服务、或图片无法读取：留占位文本。
         kept.push({ type: 'text', text: imagePlaceholder(raw, '图片') });
         continue;
       }
@@ -389,7 +487,7 @@ async function materializeImages(chatMessages, options = {}) {
   for (const message of chatMessages) {
     if (Array.isArray(message.content)) {
       const before = message.content.length;
-      message.content = extract(message.content);
+      message.content = await extract(message.content);
       // 图片被全部摘走后 tool 消息会变成空的 —— 上游不接受空 tool 结果。
       if (message.role === 'tool' && message.content.length === 0 && before > 0) {
         message.content = [{ type: 'text', text: '(see image below)' }];
@@ -859,13 +957,8 @@ export async function handleChatStream(model, stream, sink) {
   // 让客户端以为"这回合的答案就是空的"。
   const failure = failureOf(finish);
   if (failure !== undefined) {
-    sink.write(sseChunk({
-      error: {
-        message: failure.message ?? 'upstream failed',
-        type: 'api_error',
-        code: failure.code ?? 'UPSTREAM_ERROR',
-      },
-    }));
+    const classified = classifiedError(failure);
+    sink.write(sseChunk({ error: classified.body }));
     sink.write('data: [DONE]\n\n');
     return;
   }
@@ -900,8 +993,11 @@ function failedShell(id, model, created, failure) {
     output: [],
     usage: null,
     error: {
-      message: failure?.message ?? 'upstream failed',
-      code: failure?.code ?? 'UPSTREAM_ERROR',
+      message: classifyFailure(failure).hint
+        ? `${failure?.message ?? 'upstream failed'} — ${classifyFailure(failure).hint}`
+        : failure?.message ?? 'upstream failed',
+      code: classifyFailure(failure).code,
+      gateway_hint: classifyFailure(failure).hint,
     },
   };
 }
@@ -1427,7 +1523,8 @@ export function apply(ctx, rawConfig) {
         throw new HttpError(502, 'upstream returned reasoning without output text; retry', 'empty_reasoning_only');
       }
       if (failure !== undefined && collected.text === '' && collected.toolCalls.length === 0) {
-        throw new HttpError(502, failure.message ?? 'upstream failed', 'api_error');
+        const classified = classifiedError(failure);
+        throw new HttpError(classified.status, classified.body.message, classified.body.type);
       }
       return json(chatCompletionNonStream(body.model, collected));
     }
@@ -1488,7 +1585,8 @@ export function apply(ctx, rawConfig) {
         throw new HttpError(502, 'upstream returned reasoning without output text; retry', 'empty_reasoning_only');
       }
       if (failure !== undefined && collected.text === '' && collected.toolCalls.length === 0) {
-        throw new HttpError(502, failure.message ?? 'upstream failed', 'api_error');
+        const classified = classifiedError(failure);
+        throw new HttpError(classified.status, classified.body.message, classified.body.type);
       }
       return json(responsesNonStream(body.model, collected));
     }
