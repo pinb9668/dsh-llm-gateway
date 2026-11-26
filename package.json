@@ -1,6 +1,6 @@
 {
   "name": "@morgan9668/dsh-llm-gateway",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "description": "Local OpenAI-compatible gateway that exposes every model registered on the DSH llm service (DeepSeek, WorkBuddy, our-free-model) so external clients such as Codex can use them.",
   "author": "chenzhao",
@@ -48,6 +48,6 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node tests/stream-failure.mjs && node tests/body-limit.mjs"
+    "test": "node tests/stream-failure.mjs && node tests/body-limit.mjs && node tests/image-budget.mjs"
   }
 }

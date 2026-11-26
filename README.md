@@ -69,6 +69,7 @@ DSH 里通常同时挂着好几家模型：官方 DeepSeek、腾讯 WorkBuddy、
 | 工具配对修复 | 补缺结果的调用（占位正文 `(tool call was interrupted before it returned)`）、删孤儿 tool 结果、把 tool 结果挪到发起它的 assistant 之后 | 上游对不成对调用一律 `11148` |
 | 空段补位 | 空的 text 段填一个空格，整条消息没有块时补一个空格块 | 上游对空 text 段判 `11151 empty content` |
 | 图片落地 | 内联 `data:image/` 与 http(s) 图片摘出来，走 `ctx.attachments.saveImage()`，合成一条 user 消息追加到末尾 | tool 消息不能带图；base64 混在正文里会撑爆上下文 |
+| 图片预算 | 超出路由预算（默认 50 张 / 20 MB base64）时**从最老的开始省略**，换成占位文本 | 否则 DSH 适配器抛 `IMAGE_OFFLOAD_REQUIRED`，而它的会话级恢复链在无状态网关上永远修不好同一份历史 |
 | 调用上游 | `ctx.llm.stream({ provider, model, messages, reasoningEffort, maxTokens, temperature, tools })` | 唯一出口，凭据不经过网关 |
 | 回写 | 流式逐块转 SSE；非流式聚合后一次性返回；usage 按协议换算 | 客户端看到的永远是标准 OpenAI 形状 |
 
@@ -113,6 +114,8 @@ bundle 自带 `cordis.patch.yml`，安装时自动插入插件行，不需要手
 | `port` | `8392` | 监听端口；非法值静默回退到默认值，不会报错 |
 | `apiKey` | 空 | 为空表示不鉴权；非空时要求 `Authorization: Bearer <key>` 全串精确匹配 |
 | `maxBodyBytes` | 256 MiB | 单个请求体上限。Codex 每轮重发整段历史，带图会话会很大；超过就回 413。缩小它是给暴露到公网的实例加一道闸 |
+| `maxRequestImages` | `50` | 一条请求允许携带的图片数量上限；超过时省略最老的。与 DSH pi-ai 适配器的默认值对齐 |
+| `maxRequestImageBytes` | `20 MiB` | 一条请求的图片 base64 载荷总量上限；超过时省略最老的。留 5% 余量以吸收适配器重新编码的差异 |
 
 > 网关**不导出 Config schema**：所有值从插件行的 `config` 里读，缺字段就用默认值。
 > 因此写错字段名不会报错，只会被忽略——改完记得看日志里的 `listening on http://…`。
@@ -328,6 +331,9 @@ wire_api = "responses"
   这是有意的取舍——工具截图是刚需，用户贴图请走 DSH 应用内。
 - **所有图片都被集中到最后一条合成 user 消息**，原始出现位置不再保留。
 - **`max-tokens` 截断在 Responses 里报 `completed`**，不报 `incomplete`。
+- **被省略的图片不会自己回来**：图片总量超过 `maxRequestImages` / `maxRequestImageBytes` 时，
+  网关从最老的开始换成占位文本 `[image omitted: over the route image budget]`。这是每次请求
+  重新计算的确定性结果，不是持久标记——历史变短后，新请求里更老的图仍会被省略。
 - **非流式「半截正文 + 上游失败」按成功返回**：可能是 `stop` 且带半截答案，客户端无法从 `finish_reason` 区分。
 - **同分组内两个 provider 暴露同名 model 时该模型不可达**：精确匹配命中多条即 400，拆分寻址又被分组前缀规则挡住。
 - **流式无心跳帧**：长思考模型可能让连接长时间静默，中间代理可能先断。
@@ -344,9 +350,10 @@ wire_api = "responses"
 ## 开发与测试
 
 ```bash
-npm test        # 等价于下面两条
+npm test        # 等价于下面三条
 node tests/stream-failure.mjs
 node tests/body-limit.mjs
+node tests/image-budget.mjs
 ```
 
 `stream-failure.mjs` 六个用例覆盖流式失败上报的回归：上游失败必须发 `response.failed` / `error` 帧
@@ -355,6 +362,9 @@ node tests/body-limit.mjs
 `body-limit.mjs` 四个用例真正起一个网关，覆盖请求体上限：超限必须回 413 且带
 `x-should-retry: false` 与 `retry-after: 0`；`content-length` 缺失（分块上传）时仍按实际字节拦截；
 上限可由 `maxBodyBytes` 调整；默认值容得下几十 MB 的带图历史。
+
+`image-budget.mjs` 四个用例覆盖路由图片预算：数量超限时省略最老的并保留最新的；
+base64 字节超限时同样触发省略；未超限时一张不动；省略后确实落在预算内。
 
 未覆盖的部分（改代码时自己补测）：请求转换与配对修复、槽位换算、路由解析、附件落地、状态码映射表、
 认证。

@@ -93,6 +93,25 @@ become empty. Limits: 8 MB per image, `png` / `jpeg` / `webp` / `gif`, and a
 Images inside a Responses `message` item are reduced to placeholder text; only
 `function_call_output` images are materialised as real attachments.
 
+## Image budget
+
+DSH's pi-ai adapter caps one request at `maxRequestImages` (50) image occurrences and
+`maxRequestImageBytes` (20 MiB) of accumulated base64. Over that it throws
+`IMAGE_OFFLOAD_REQUIRED`, and `dsh-compaction-image-offload` recovers by recording an
+`image/offload` event in the **session** and retrying. That recovery cannot work through
+the gateway: every turn is a fresh HTTP request and the image blocks are rebuilt from the
+wire history, so the same oversized request is reconstructed every time and the client
+sees `stream disconnected before completion: ... N more oldest occurrence(s) must be
+offloaded` on a loop.
+
+The gateway therefore applies the same budget itself, deterministically within one
+request: the oldest occurrences become `[image omitted: over the route image budget]`
+until the request fits. Both limits are configurable (`maxRequestImages`,
+`maxRequestImageBytes`), and the byte check keeps a 5% margin because the adapter
+re-encodes each image to its own target before measuring. Omissions are recomputed per
+request, not persisted, so an image that was omitted stays omitted only while the
+history remains oversized.
+
 ## Errors
 
 Upstream failures map to a status plus one actionable sentence:
@@ -186,6 +205,10 @@ partial text; normal answers are unaffected.
 request-body limit: an oversized body must return 413 with `x-should-retry: false`
 and `retry-after: 0`; a missing `content-length` (chunked upload) is still counted;
 `maxBodyBytes` is honoured; and the default accepts tens of megabytes.
+
+`node tests/image-budget.mjs` runs four cases for the route image budget: oldest
+occurrences are omitted first while the newest are kept; a byte overflow also triggers
+omission; nothing is touched below the budget; and the result really fits.
 
 Conversion, pairing repair, slots, routing, attachments and the status map are not
 covered.

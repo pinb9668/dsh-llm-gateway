@@ -24,6 +24,10 @@ const DEFAULTS = {
   // 请求体上限。Codex 每轮都会把整段历史重发一遍，带图的会话里 base64 图片
   // 会把这一个请求推到几十 MB —— 默认值必须容得下正常的多图历史。
   maxBodyBytes: 256 * 1024 * 1024,
+  // 路由图片预算：与 DSH pi-ai 适配器的默认值对齐，略保守一点。超过时网关自己
+  // 省略最老的图片，而不是让适配器抛 IMAGE_OFFLOAD_REQUIRED（见 applyImageBudget）。
+  maxRequestImages: 50,
+  maxRequestImageBytes: 20 * 1024 * 1024,
 };
 const CACHE_MS = 10_000;
 const GROUP_PREFIXES = new Set(['deepseek', 'buddy', 'free']);
@@ -123,6 +127,8 @@ function normalizeConfig(raw) {
     if (Number.isInteger(raw.port) && raw.port > 0 && raw.port < 65536) config.port = raw.port;
     if (typeof raw.apiKey === 'string') config.apiKey = raw.apiKey;
     if (Number.isInteger(raw.maxBodyBytes) && raw.maxBodyBytes > 0) config.maxBodyBytes = raw.maxBodyBytes;
+    if (Number.isInteger(raw.maxRequestImages) && raw.maxRequestImages > 0) config.maxRequestImages = raw.maxRequestImages;
+    if (Number.isInteger(raw.maxRequestImageBytes) && raw.maxRequestImageBytes > 0) config.maxRequestImageBytes = raw.maxRequestImageBytes;
   }
   return config;
 }
@@ -617,6 +623,80 @@ export function chatMessagesToDsh(rawMessages, options = {}) {
  *
  * 没有 attachments 服务时，退化为占位文本——模型看不到图，但请求不会炸。
  */
+const IMAGE_OFFLOAD_PLACEHOLDER = '[image omitted: over the route image budget]';
+const DEFAULT_MAX_REQUEST_IMAGES = 50;
+const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 20 * 1024 * 1024;
+/** pi-ai 适配器的单张请求图片编码字节目标（requestImageMaxBytes 的默认值）。 */
+const REQUEST_IMAGE_TARGET_BYTES = 1024 * 1024;
+
+/**
+ * 按 DSH 的路由预算省略最老的图片。
+ *
+ * DSH 的 pi-ai 适配器对一条请求有硬预算：最多 `maxRequestImages`（默认 50）张
+ * 图片出现，base64 载荷合计不超过 `maxRequestImageBytes`（默认 20 MB）。超了它
+ * 抛 `IMAGE_OFFLOAD_REQUIRED`，由 `dsh-compaction-image-offload` 在会话里记一条
+ * `image/offload` 事件、把最老的若干位置标记成省略，然后重试。
+ *
+ * 那条恢复链**只在 DSH 自己的会话里成立**：它靠会话事件记住哪个位置被省略过。
+ * 走网关时每一轮都是新的 HTTP 请求，网关每轮原地重建图片块，省略标记无处安放，
+ * 于是重试还是同样超限——表现就是 Codex 里反复出现
+ * 「stream disconnected before completion: ... N more oldest occurrence(s) must be offloaded」。
+ *
+ * 所以网关自己按**请求内**的确定性规则做同一件事：从最老的图片开始省略，直到
+ * 装进预算。同一份历史每次都会被省略成同一组图片，不依赖跨请求状态。
+ *
+ * 返回保留的图片下标集合（省略掉的会换成占位文本）。
+ */
+/**
+ * 把请求里的图片压进路由预算，办法是**从最老的开始省略**。
+ *
+ * 预算按适配器的口径算：每张图按 base64 长度计入（`ceil(bytes/3)*4`），
+ * 数量与总字节两条都要满足。留 5% 余量，因为适配器算的是它自己重新编码后的
+ * base64，和这里的估计不会逐字节相同。
+ *
+ * 直接在传入的消息数组上原地改写：被省略的位置换成占位文本。
+ */
+export function applyImageBudget(messages, limit) {
+  const maxImages = Number.isInteger(limit?.maxImages) && limit.maxImages > 0
+    ? limit.maxImages
+    : DEFAULT_MAX_REQUEST_IMAGES;
+  const maxBytes = Number.isInteger(limit?.maxBytes) && limit.maxBytes > 0
+    ? limit.maxBytes
+    : DEFAULT_MAX_REQUEST_IMAGE_BYTES;
+  const bytesBudget = Math.floor(maxBytes * 0.95);
+
+  // 按模型请求顺序收集每个图片出现位置。
+  const occurrences = [];
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (let index = 0; index < message.content.length; index += 1) {
+      const block = message.content[index];
+      if (block?.type !== 'image') continue;
+      // 适配器发出的不是上传时的原始字节，而是它按路由目标（默认 1 MiB/张）
+      // 重新编码后的结果。用两者的较小值估计，避免高估后多省略本来装得下的图。
+      const uploaded = Number(block.attachment?.bytes ?? 0);
+      const bytes = Math.min(uploaded, REQUEST_IMAGE_TARGET_BYTES);
+      occurrences.push({ message, index, base64: Math.ceil(bytes / 3) * 4 });
+    }
+  }
+  if (occurrences.length === 0) return 0;
+
+  let total = occurrences.reduce((sum, o) => sum + o.base64, 0);
+  let count = occurrences.length;
+  let omitted = 0;
+  for (const occurrence of occurrences) {
+    if (count <= maxImages && total <= bytesBudget) break;
+    total -= occurrence.base64;
+    count -= 1;
+    occurrence.message.content[occurrence.index] = {
+      type: 'text',
+      text: IMAGE_OFFLOAD_PLACEHOLDER,
+    };
+    omitted += 1;
+  }
+  return omitted;
+}
+
 async function materializeImages(chatMessages, options = {}) {
   const attachments = options.attachments;
   /** 待发的图片：{ mediaType, bytes } */
@@ -692,6 +772,7 @@ async function materializeImages(chatMessages, options = {}) {
 
   // 把收集到的图落成附件。
   const blocks = [];
+  const lengths = [];
   for (const img of pending) {
     try {
       const ref = await attachments.saveImage({
@@ -699,10 +780,14 @@ async function materializeImages(chatMessages, options = {}) {
         mediaType: img.mediaType,
         name: `gateway-image-${Date.now()}`,
       });
+      // 记下这张图上传时的字节数：预算按 base64 载荷算，而保存后的 ref.bytes
+      // 是规范化（可能被缩过）之后的值，两者不能混用。
       blocks.push({ type: 'image', attachment: ref });
+      lengths.push(img.bytes.length);
     } catch (error) {
       // 单张图存不进去不该整轮失败：换成占位文本继续。
       blocks.push({ type: 'text', text: imagePlaceholder(undefined, '图片') });
+      lengths.push(0);
       void error;
     }
   }
@@ -713,6 +798,19 @@ async function materializeImages(chatMessages, options = {}) {
     content: [{ type: 'text', text: TOOL_IMAGE_PLACEHOLDER }, ...blocks],
     source: { kind: 'user' },
   });
+
+  // 省略（而不是拒绝）超出路由图片预算的最老若干张。见 applyImageBudget：
+  // 不这么做时，DSH 的适配器会抛 IMAGE_OFFLOAD_REQUIRED，而它的会话级恢复链在
+  // 网关这条无状态路径上永远修不好同一个历史。
+  const omitted = applyImageBudget(out, {
+    maxImages: options.maxRequestImages,
+    maxBytes: options.maxRequestImageBytes,
+  });
+  if (omitted > 0 && typeof options.log === 'function') {
+    options.log(
+      `image budget: omitted ${omitted} oldest image(s) to fit the route budget; ${blocks.length - omitted} sent`,
+    );
+  }
   return out;
 }
 
@@ -1721,7 +1819,12 @@ export function apply(ctx, rawConfig) {
     if (request.method === 'POST' && path === '/v1/chat/completions') {
       const body = await readJson(request, config.maxBodyBytes);
       let messages = chatMessagesToDsh(body.messages, { provider: 'gateway', model: body.model });
-      messages = await materializeImages(messages, { attachments: attachmentsService });
+      messages = await materializeImages(messages, {
+        attachments: attachmentsService,
+        maxRequestImages: config.maxRequestImages,
+        maxRequestImageBytes: config.maxRequestImageBytes,
+        log,
+      });
       if (messages.length === 0) throw new HttpError(400, 'messages must not be empty');
       const { route, options } = await buildOptions(body, messages, requestedEffortOf(body));
 
@@ -1774,7 +1877,12 @@ export function apply(ctx, rawConfig) {
     if (request.method === 'POST' && path === '/v1/responses') {
       const body = await readJson(request, config.maxBodyBytes);
       let messages = responsesToDsh(body, { provider: 'gateway', model: body.model });
-      messages = await materializeImages(messages, { attachments: attachmentsService });
+      messages = await materializeImages(messages, {
+        attachments: attachmentsService,
+        maxRequestImages: config.maxRequestImages,
+        maxRequestImageBytes: config.maxRequestImageBytes,
+        log,
+      });
       if (messages.length === 0) throw new HttpError(400, 'input must not be empty');
       const bodyForOptions = {
         ...body,
