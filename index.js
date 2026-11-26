@@ -278,31 +278,108 @@ function failureOf(reason) {
  * as account failures: retrying the same body or rotating accounts is useless
  * there. Only account/transport failures get 502/429 and may recover.
  */
+/**
+ * 把上游失败分类成「HTTP 状态 + 机器码 + 人能照做的一句话」。
+ *
+ * 提示语的写法参照 `dsh-connect-workbuddy`：它给每条失败都写清三件事——
+ * **这是什么**、**和账号/额度有没有关系**、**现在该做什么**。它那句
+ * 「这不是账号被限流，也与积分、额度无关——同一凭据下换一个模型即可正常使用；
+ * 插件不会为此切换账号，因为该限制跟随模型本身」比一句 "upstream error" 有用得多，
+ * 因为读者能据此立刻决定「重发还是换模型还是等」。
+ *
+ * 这里同样区分「重发有用」与「重发无用」：
+ *   - PROMPT_TOO_LONG 重发还是太长 → 要压缩历史或新建任务
+ *   - TOOL_MISMATCH   同一份历史重发还是不一致 → 只能新建任务
+ *   - CHANNEL_REJECT  按内容拒绝，换账号也一样 → 改系统提示或换模型
+ *   - IMAGE_INVALID   图本身坏了 → 换一张小图
+ * 这几条都不该让客户端白重试（见 NON_RETRYABLE_CODES）。
+ */
 function classifyFailure(failure) {
   const code = String(failure?.code ?? '').toUpperCase();
   const message = String(failure?.message ?? '');
   if (code === 'ACCOUNT_QUOTA' || /insufficient balance|credits exhausted|余额不足|额度不足/i.test(message)) {
-    return { status: 402, code: 'ACCOUNT_QUOTA', hint: 'Upstream account has no balance; top up or switch model group.' };
+    return {
+      status: 402,
+      code: 'ACCOUNT_QUOTA',
+      hint: 'The upstream account is out of credit. Top up that account, or switch to another model group; retrying this request will not help.',
+    };
   }
   if (code === 'RATE_LIMIT' || /rate limit|quota exceeded|too many requests|429|限流|冷却/i.test(message)) {
-    return { status: 429, code: 'RATE_LIMIT', hint: 'Upstream is rate limited; retry after the cooldown or use another group.' };
+    return {
+      status: 429,
+      code: 'RATE_LIMIT',
+      hint: 'The upstream is rate limited or cooling down. Wait for the cooldown to lift, or use another model group; retrying immediately returns the same answer.',
+    };
   }
   if (/11148|tool invocation|tool_call.*match|工具调用记录/i.test(message)) {
-    return { status: 400, code: 'TOOL_MISMATCH', hint: 'Tool-call history is inconsistent; start a new task.' };
+    return {
+      status: 400,
+      code: 'TOOL_MISMATCH',
+      hint: 'The tool-call history is inconsistent (call without result, or result without call). Start a new task; resending the same history is rejected again.',
+    };
   }
   if (/11128|unapproved channel|渠道校验|request illegal/i.test(message)) {
-    return { status: 400, code: 'CHANNEL_REJECT', hint: 'Upstream rejected the prompt shape; shorten the system prompt or switch model.' };
+    return {
+      status: 400,
+      code: 'CHANNEL_REJECT',
+      hint: 'The upstream rejected the prompt by content, not by account or quota. Shorten or neutralise the system prompt, or switch models.',
+    };
   }
   if (/11135|invalid image|image.*invalid|图片/i.test(message)) {
-    return { status: 400, code: 'IMAGE_INVALID', hint: 'Upstream could not read the image; use a small PNG/JPEG data URL.' };
+    return {
+      status: 400,
+      code: 'IMAGE_INVALID',
+      hint: 'The upstream could not read the image. Use a smaller PNG/JPEG/WebP, or remove the image from the request.',
+    };
   }
   if (/11115|prompt is too long|context.*exceed|超长|上下文/i.test(message)) {
-    return { status: 400, code: 'PROMPT_TOO_LONG', hint: 'Input exceeds the model context; shorten the conversation.' };
+    return {
+      status: 400,
+      code: 'PROMPT_TOO_LONG',
+      hint: 'The conversation exceeds the model context window. Compact the history or start a new task; the same history will be rejected again.',
+    };
   }
   if (/11151|empty content/i.test(message)) {
-    return { status: 400, code: 'EMPTY_CONTENT', hint: 'A message had empty content; this was repaired where possible.' };
+    return {
+      status: 400,
+      code: 'EMPTY_CONTENT',
+      hint: 'A message had empty content. The gateway pads these before sending, so this came from a shape it could not repair; retry once, then start a new task.',
+    };
   }
   return { status: 502, code: failure?.code ?? 'UPSTREAM_ERROR', hint: undefined };
+}
+
+/**
+ * 这次失败重试有没有意义。
+ *
+ * 照搬 dsh-connect-workbuddy 的判据哲学：**同一份请求换谁、隔多久都会被同一处
+ * 拒绝的失败，不该让客户端反复重试**。那一侧为排队（6020/6021/6022）专门加了
+ * `x-should-retry: false`，理由写得很清楚——没有它时 429 会被按状态码无条件重试
+ * 五轮、合计约 15 秒，每一次都是真实请求换来同一句「你还在第 8777 位」。
+ *
+ * 这里的对应关系：
+ *   - PROMPT_TOO_LONG  历史太长，重发还是太长 → 不重试，让客户端去压缩/新建任务
+ *   - TOOL_MISMATCH    工具历史不一致，同样的历史重发还是不一致 → 不重试
+ *   - CHANNEL_REJECT   按内容拒绝，换账号也一样 → 不重试
+ *   - IMAGE_INVALID    图片本身坏了 → 不重试
+ *   - EMPTY_CONTENT    空段已在出站补位，走到这里说明是请求形态问题 → 不重试
+ *   - ACCOUNT_QUOTA    余额/额度耗尽，短时间内不会自己好 → 不重试
+ *   - RATE_LIMIT       冷却中，retry-after 才是准的 → 不重试（等提示的时间再发）
+ *   - 其余（5xx/网络）  是瞬时故障，**应该**重试 → 不带头
+ */
+const NON_RETRYABLE_CODES = new Set([
+  'PROMPT_TOO_LONG',
+  'TOOL_MISMATCH',
+  'CHANNEL_REJECT',
+  'IMAGE_INVALID',
+  'EMPTY_CONTENT',
+  'ACCOUNT_QUOTA',
+  'RATE_LIMIT',
+]);
+
+/** 给一次已分类的失败挑响应头：不可重试的失败要显式说不。 */
+function headersForFailure(classified) {
+  return NON_RETRYABLE_CODES.has(classified.code) ? NO_RETRY_HEADERS : undefined;
 }
 
 /** Build an OpenAI-shaped error object with the classified status and hint. */
@@ -310,6 +387,7 @@ function classifiedError(failure) {
   const classified = classifyFailure(failure);
   return {
     status: classified.status,
+    headers: headersForFailure(classified),
     body: {
       message: classified.hint
         ? `${failure?.message ?? 'upstream failed'} — ${classified.hint}`
@@ -319,6 +397,67 @@ function classifiedError(failure) {
       gateway_hint: classified.hint,
     },
   };
+}
+
+/**
+ * DSH TokenUsage -> OpenAI usage。
+ *
+ * 为什么单列 cache 计数：`dsh-connect-workbuddy` 那侧专门记录过这件事——
+ * 缓存命中数在两个网关上用了**两个不同的字段名**（OpenAI 的
+ * `prompt_tokens_details.cached_tokens` 与国内网关的 `prompt_cache_hit_tokens`），
+ * 只报一个会让另一个区域永远显示 0。这里把 DSH 侧的 `cacheReadTokens` 同时写到
+ * 两个位置，下游按哪个读都能读到真实值。
+ *
+ * `reasoning_tokens` 同理：它是 output 的一部分，但要单列，
+ * 否则客户端无法把「思考花掉的钱」和「正文花掉的钱」分开看。
+ */
+/**
+ * OpenAI usage -> Responses 协议的 usage 形状。
+ *
+ * Responses 用 `input_tokens` / `output_tokens` / `total_tokens`，
+ * 缓存计数在 `input_tokens_details.cached_tokens`（与 Chat 的
+ * `prompt_tokens_details` 同义不同名）。两处都保留，客户端按自己的协议读。
+ */
+function responsesUsageToWire(usage) {
+  const prompt = usage?.prompt_tokens ?? 0;
+  const completion = usage?.completion_tokens ?? 0;
+  const out = {
+    input_tokens: prompt,
+    output_tokens: completion,
+    total_tokens: usage?.total_tokens ?? prompt + completion,
+  };
+  const cached = usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.prompt_cache_hit_tokens;
+  if (typeof cached === 'number' && cached > 0) {
+    out.input_tokens_details = { cached_tokens: cached };
+  }
+  const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
+  if (typeof reasoning === 'number' && reasoning > 0) {
+    out.output_tokens_details = { reasoning_tokens: reasoning };
+  }
+  return out;
+}
+
+function usageToOpenAI(usage) {
+  if (usage === undefined || usage === null) return undefined;
+  const prompt = usage.inputTokens ?? 0;
+  const completion = usage.outputTokens ?? 0;
+  const total = usage.totalTokens ?? prompt + completion;
+  const cacheRead = usage.cacheReadTokens;
+  const out = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total,
+  };
+  if (typeof cacheRead === 'number' && cacheRead > 0) {
+    // 两种拼写都写，见上面的说明。
+    out.prompt_tokens_details = { cached_tokens: cacheRead };
+    out.prompt_cache_hit_tokens = cacheRead;
+  }
+  if (typeof usage.reasoningTokens === 'number' && usage.reasoningTokens > 0) {
+    out.completion_tokens_details = { reasoning_tokens: usage.reasoningTokens };
+  }
+  return out;
 }
 
 function uuid() {
@@ -770,11 +909,8 @@ async function collectStream(stream) {
         break;
       }
       case 'usage':
-        result.usage = {
-          prompt_tokens: chunk.usage?.inputTokens ?? 0,
-          completion_tokens: chunk.usage?.outputTokens ?? 0,
-          total_tokens: chunk.usage?.totalTokens ??
-            ((chunk.usage?.inputTokens ?? 0) + (chunk.usage?.outputTokens ?? 0)),
+        result.usage = usageToOpenAI(chunk.usage) ?? {
+          prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
         };
         break;
       case 'finish':
@@ -793,15 +929,68 @@ async function collectStream(stream) {
  * ------------------------------------------------------------------ */
 
 class HttpError extends Error {
-  constructor(status, message, type = 'invalid_request_error') {
+  /**
+   * @param {number} status
+   * @param {string} message
+   * @param {string} [type]
+   * @param {Record<string,string>} [headers] 需要额外附带的响应头，
+   *   最常用的是 `x-should-retry: false`（见 NO_RETRY_HEADERS 的说明）。
+   */
+  constructor(status, message, type = 'invalid_request_error', headers = undefined) {
     super(message);
     this.status = status;
     this.type = type;
+    this.headers = headers;
   }
 }
 
+/**
+ * 明确告诉所有会自动重试的客户端：这次失败**不要重试**。
+ *
+ * 为什么需要它（照搬 dsh-connect-workbuddy 的做法）：`x-should-retry` 不是标准
+ * 头，但这条链上的两个客户端都会在看 HTTP 状态码**之前**先读它 —— 固定版本的
+ * OpenAI SDK 的 `shouldRetry` 与 pi-ai 的 `isRetryableProviderError` 都认
+ * `"false"`。没有它时，429 会被按状态码无条件重试（宿主一轮 5 次、0.5s→8s 退避，
+ * 合计约 15 秒），而排队类失败重试多少次都还是同一个位次，等于白烧请求。
+ *
+ * 同时把 `retry-after` 置 "0"：声明自己是最终答案的诊断，就必须真的是最终的。
+ */
+const NO_RETRY_HEADERS = Object.freeze({
+  'x-should-retry': 'false',
+  'retry-after': '0',
+});
+
+/**
+ * 请求体超限。用一个具名类而不是「message 里带魔数」：
+ * 调用方必须对它回 **413**（协议上的正确答案），当成普通内部错误会变成 500。
+ */
+class RequestBodyTooLargeError extends HttpError {
+  constructor(limitBytes) {
+    super(413, `request body too large (limit ${limitBytes} bytes)`, 'invalid_request_error');
+    this.name = 'RequestBodyTooLargeError';
+    this.limitBytes = limitBytes;
+  }
+}
+
+/**
+ * 网关接受的请求体上限。
+ *
+ * 参考 dsh-connect-workbuddy 的 RequestBodyTooLargeError：超限必须回 **413**，
+ * 而不是让它变成一个内存爆掉后的 500。这里比插件宽松（图片 base64 会很大），
+ * 但仍然是有限的。
+ */
+const REQUEST_BODY_LIMIT = 64 * 1024 * 1024;
+
 async function readJson(request) {
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (Number.isFinite(declared) && declared > REQUEST_BODY_LIMIT) {
+    throw new RequestBodyTooLargeError(REQUEST_BODY_LIMIT);
+  }
   const text = await request.text();
+  // content-length 不可信（可能缺失或撒谎），按实际读到的字节再卡一次。
+  if (Buffer.byteLength(text, 'utf8') > REQUEST_BODY_LIMIT) {
+    throw new RequestBodyTooLargeError(REQUEST_BODY_LIMIT);
+  }
   if (text.trim() === '') return {};
   try {
     return JSON.parse(text);
@@ -810,16 +999,16 @@ async function readJson(request) {
   }
 }
 
-function json(value, status = 200) {
+function json(value, status = 200, headers = undefined) {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
+    headers: { 'content-type': 'application/json; charset=utf-8', ...(headers ?? {}) },
   });
 }
 
 function errorResponse(error) {
   if (error instanceof HttpError) {
-    return json({ error: { message: error.message, type: error.type } }, error.status);
+    return json({ error: { message: error.message, type: error.type } }, error.status, error.headers);
   }
   const message = error instanceof Error ? error.message : String(error);
   return json({ error: { message, type: 'api_error' } }, 500);
@@ -948,12 +1137,7 @@ export async function handleChatStream(model, stream, sink) {
         break;
       }
       case 'usage':
-        usage = {
-          prompt_tokens: chunk.usage?.inputTokens ?? 0,
-          completion_tokens: chunk.usage?.outputTokens ?? 0,
-          total_tokens: chunk.usage?.totalTokens ??
-            ((chunk.usage?.inputTokens ?? 0) + (chunk.usage?.outputTokens ?? 0)),
-        };
+        usage = usageToOpenAI(chunk.usage) ?? usage;
         break;
       case 'finish':
         finish = chunk.reason;
@@ -1048,7 +1232,7 @@ function responsesNonStream(model, collected) {
     Math.floor(Date.now() / 1000),
     'completed',
     output,
-    { input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens, total_tokens: usage.total_tokens },
+    responsesUsageToWire(usage),
   );
 }
 
@@ -1215,11 +1399,19 @@ export async function handleResponsesStream(model, stream, sink) {
 
   const inputTokens = usage?.inputTokens ?? 0;
   const outputTokens = usage?.outputTokens ?? 0;
-  const tokenUsage = {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
+  // 流式收尾也走同一个转换：缓存与 reasoning 计数照样要报，否则客户端
+  // 在流式会话里永远看不到缓存命中率。
+  const tokenUsage = responsesUsageToWire({
+    prompt_tokens: inputTokens,
+    completion_tokens: outputTokens,
     total_tokens: usage?.totalTokens ?? (inputTokens + outputTokens),
-  };
+    ...(typeof usage?.cacheReadTokens === 'number'
+      ? { prompt_tokens_details: { cached_tokens: usage.cacheReadTokens } }
+      : {}),
+    ...(typeof usage?.reasoningTokens === 'number'
+      ? { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } }
+      : {}),
+  });
 
   // 上游失败必须说清楚。此前这里无条件发 response.completed：一次"余额不足 /
   // 配额用尽 / 上游异常"会被 Codex 读成"成功但内容为空"，界面上表现为模型
@@ -1534,7 +1726,7 @@ export function apply(ctx, rawConfig) {
       }
       if (failure !== undefined && collected.text === '' && collected.toolCalls.length === 0) {
         const classified = classifiedError(failure);
-        throw new HttpError(classified.status, classified.body.message, classified.body.type);
+        throw new HttpError(classified.status, classified.body.message, classified.body.type, classified.headers);
       }
       return json(chatCompletionNonStream(body.model, collected));
     }
@@ -1596,7 +1788,7 @@ export function apply(ctx, rawConfig) {
       }
       if (failure !== undefined && collected.text === '' && collected.toolCalls.length === 0) {
         const classified = classifiedError(failure);
-        throw new HttpError(classified.status, classified.body.message, classified.body.type);
+        throw new HttpError(classified.status, classified.body.message, classified.body.type, classified.headers);
       }
       return json(responsesNonStream(body.model, collected));
     }
